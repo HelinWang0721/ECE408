@@ -191,9 +191,49 @@
 9. `__restrict__` 会改变程序语义吗？什么情况下使用它是错误的？
 10. 用 Nsight Compute 看到 "long scoreboard" stall 占主导，说明了什么？
 
+## 9.5 实测结果：RTX PRO 6000 Blackwell（sm_120，CUDA 13.4，batch 5000）
+
+| 实现 | layer1 (C=1,M=4,86→80) | layer2 (C=4,M=16,40→34) | 合计 | 相对 base |
+|---|---|---|---|---|
+| base | 3.411 ms | 22.062 ms | 25.473 ms | 1.0× |
+| op1 分块共享内存 | 2.800 | 9.064 | 11.864 | 2.1× |
+| op2 unroll + GEMM | 21.924 | 16.796 | 38.720 | 0.66× |
+| op3 FP16 | 3.815 | 8.574 | 12.389 | 2.1× |
+| op4 通道树形归约 | 1.815 | 16.297 | 18.112 | 1.4× |
+| op5 常量 + restrict/展开 + 归约 | 1.278 | 12.064 | 13.342 | 1.9× |
+| **new-forward** | **1.061** | **3.366** | **4.427** | **5.8×** |
+
+参照：课程在 V100 上的要求是合计 ≤ 40 ms（baseline 约 100 ms）。
+
+**Roofline 粗算**：
+- layer1：12.5 GFLOP，最少要搬 0.66 GB（输出 512 MB 占了大头）。new-forward 跑出约 11.8 TFLOP/s、约 620 GB/s。
+- layer2：36.3 GFLOP，0.50 GB。new-forward 跑出约 10.8 TFLOP/s、约 150 GB/s。
+- 这张卡的标称带宽约 1.8 TB/s，FP32 峰值 100+ TFLOP/s。所以 layer1 偏**带宽**瓶颈，还有 2–3 倍空间；layer2 的带宽和算力都没用满，卡在**指令、访存延迟**上：每次乘加都要一次 load，数据复用太少。
+
+**从数据里读出的知识点**：
+1. **Tile 量化浪费**：
+   - base 用 32×32 的 block，layer2 的输出是 34×34，需要 2×2 个 tile，即 64×64 = 4096 个线程去算 1156 个像素，**只有 28% 的线程在干活**。这是 base 的 layer2 特别慢（22 ms）的主要原因。
+   - 16×16 的 block 在 layer2 上利用率是 50%，在 layer1（80×80）上是 100%。
+   - 改进方向：把 (h, w) 展平成一维下标，或者针对 34 选一个合适的 tile 尺寸。这就是「参数扫描」那 0.5 分要做的事。
+2. **op2 反而最慢**：
+   - im2col 把 layer1 的输入放大了 49 倍（约 6.3 GB 的读写）；
+   - M = 4 时，16 行的 GEMM tile 有 75% 的线程是空闲的；
+   - 计时区间里还包含了 cudaMalloc。
+   - 这正好说明为什么要做 **kernel fusion**，以及 GEMM 化只适合 M 和 CKK 都比较大的层。
+3. **op4/op5 的归约在 layer2 上吃亏**：C 只有 4，而 T×T×CZ = 1024 的 block 加上 shared memory 和 barrier 的开销，已经超过了多出来的并行度带来的收益。在 layer1（C=1，没有归约）上它们反而很快。结论：**树形归约适合 C 大的层**。
+4. **op3 FP16**：
+   - layer2 比 base 快 2.6 倍：读取的字节数减半，而且 BLOCK 用的是 16；
+   - layer1 反而更慢：C = 1 时计算量小，float→half 转换 kernel 的开销成了大头。
+5. **new-forward 为什么最快**：
+   - 常量内存广播 mask（warp 内所有线程读同一个地址）；
+   - `<K, C>` 模板完全展开，去掉了循环和下标计算；
+   - 没有 barrier，也没有 shared memory 的开销；
+   - 16×16 的 block 在 layer1 上没有浪费。
+
 ## 10. 下一步（按优先级）
 
-- [ ] 在本机 Blackwell 上运行 `tools/run_all_windows.ps1`，记录各实现在 batch 5000 下的 Op Time，并做**参数扫描**（BLOCK_SIZE 取 8/16/32，+0.5 分）。
+- [x] 在本机 Blackwell 上运行 `tools/run_all_windows.ps1`，记录 batch 5000 下的 Op Time（见 §9.5）。
+- [ ] **参数扫描 + 一维展平映射**（+0.5 分），消除 layer2 上 34×34 的 tile 量化浪费。
 - [ ] **Kernel fusion**（unroll + GEMM，+2 分）：在 op2 的基础上把 unroll 融进 GEMM 的 tile 装载里。
 - [ ] **寄存器分块 GEMM**（+5 分）：每个线程计算 4×4 或 8×8 个输出，shared memory 采用 double buffering。
 - [ ] **Tensor Core**（+5 分）：用 WMMA 的 `fragment<matrix_a,16,16,16,half,...>` 来做 op2 的 GEMM。
@@ -216,4 +256,4 @@
 
 - **MP1–MP8**：73/73 个数据集通过。
 - **Project**：7 个实现 × 7 个用例全部通过。用例包括 m1/m2/m3 的 4 个测试、LeNet 的两层、一个非方形 K=5 的通用用例；op2 的分块路径也单独验证过。
-- **尚未验证**：在真实 GPU 上的性能数字和 RAI 上的最终精度。
+- **真机（RTX PRO 6000 Blackwell，Windows，CUDA 13.4）**：MP 73/73 通过，Project 7/7 通过，计时见 §9.5。尚未在 RAI（V100）上跑完整网络的精度测试。
