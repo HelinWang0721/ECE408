@@ -84,8 +84,9 @@ if (-not $SkipMPs) {
         }
         # replay the dataset command lines from the MP's run_datasets script
         $script = Get-Content "$Root\$mp\run_datasets" -Raw
-        $ids = ([regex]"for i in ([0-9 ]+)").Match($script).Groups[1].Value.Trim() -split "\s+"
-        $line = ($script -split "`n" | Where-Object { $_ -match "^\s*\./template" })[0].Trim()
+        $ids = @(([regex]"for i in ([0-9 ]+)").Match($script).Groups[1].Value.Trim() -split "\s+")
+        # @(...) keeps a single match an array; otherwise [0] would be its first character
+        $line = @($script -split "`n" | Where-Object { $_ -match "^\s*\./template" })[0].Trim()
         $pass = 0; $fail = 0
         foreach ($i in $ids) {
             $argLine = $line.Replace('${i}', $i) -replace '^\./template\s*', ''
