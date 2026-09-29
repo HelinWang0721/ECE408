@@ -18,65 +18,21 @@
     }                                                                     \
   } while (0)
 
-__shared__ float shared[BLOCK_SIZE * 2];
+// Hierarchical (3-phase) Brent-Kung scan:
+//   1. scan          : each block scans 2*BLOCK_SIZE elements, writes its total to aux[]
+//   2. scan (1 block): scan the per-block totals aux[] -> blockSums[]
+//   3. addBlockSums  : add blockSums[b-1] to every element of block b
+// Phase 2 runs in one block, so numBlocks <= 2*BLOCK_SIZE (inputs up to 1M elements).
 
-__global__ void scanLast(float *input, float *output, int len) {
-
+__global__ void addBlockSums(float *blockSums, float *output, int len) {
   int start = 2 * blockIdx.x * blockDim.x + threadIdx.x;
 
-  if(blockIdx.x > 0) {
-    if(start < len)
-       output[start] += input[blockIdx.x-1];
-    if(start + blockDim.x < len)
-       output[start+blockDim.x] += input[blockIdx.x-1];
+  if (blockIdx.x > 0) {
+    if (start < len)
+      output[start] += blockSums[blockIdx.x - 1];
+    if (start + blockDim.x < len)
+      output[start + blockDim.x] += blockSums[blockIdx.x - 1];
   }
-}
-
-__global__ void add(float *input, float *output, int len){
-
-  int start = 2 * blockIdx.x * blockDim.x + threadIdx.x;
-
-  if(start < len)
-  shared[threadIdx.x] = input[start];
-  else
-    shared[threadIdx.x] = 0.0;
-  if(start+blockDim.x < len)
-    shared[blockDim.x + threadIdx.x] = input[start + blockDim.x];
-  else
-    shared[blockDim.x + threadIdx.x] = 0.0;
-
-  __syncthreads();
-
-  //reduction
-  int stride = 1;
-  while(stride <= 2*BLOCK_SIZE) 
-  {
-      int index = (threadIdx.x+1)*stride*2 - 1;
-      if(index < 2*BLOCK_SIZE && (index-stride) >= 0)
-          shared[index] += shared[index-stride];
-      stride *= 2;
-      __syncthreads();
-  }
-
-  //post scan
-  stride = BLOCK_SIZE/2;   
-  while(stride > 0)
-  {
-      int index = (threadIdx.x+1)*stride*2 - 1;
-      if((index+stride) < 2*BLOCK_SIZE)
-      {
-          shared[index + stride] += shared[index];
-      }				
-      stride /= 2;	
-      __syncthreads();
-  }
-
-__syncthreads();
-
-if(start < len)
-  output[start] = shared[threadIdx.x];
-if(start+blockDim.x < len)
-  output[start+blockDim.x] = shared[blockDim.x + threadIdx.x];
 }
 
 __global__ void scan(float *input, float *output, float *aux, int len) {
@@ -84,53 +40,43 @@ __global__ void scan(float *input, float *output, float *aux, int len) {
   //@@ the scan on the device
   //@@ You may need multiple kernel calls; write your kernels before this
   //@@ function and call them from the host
+  __shared__ float shared[BLOCK_SIZE * 2];
 
-  int start = 2 * blockIdx.x * blockDim.x +  threadIdx.x;
-  
-  if(start < len)
+  int start = 2 * blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (start < len)
     shared[threadIdx.x] = input[start];
   else
     shared[threadIdx.x] = 0.0;
-  if(start+blockDim.x < len)
-    shared[blockDim.x + threadIdx.x] = input[start+blockDim.x];
+  if (start + blockDim.x < len)
+    shared[blockDim.x + threadIdx.x] = input[start + blockDim.x];
   else
     shared[blockDim.x + threadIdx.x] = 0.0;
-  
-  __syncthreads();
-  
-  int stride = 1;
-  while(stride <= 2*BLOCK_SIZE)  // calculate first half
-  {
-       int index = (threadIdx.x+1)*stride*2 - 1;
-       if(index < 2*BLOCK_SIZE && (index-stride) >= 0)
-          shared[index] += shared[index-stride];
-       stride *= 2;
-       __syncthreads();
+
+  // up-sweep (reduction tree)
+  for (int stride = 1; stride < 2 * BLOCK_SIZE; stride *= 2) {
+    __syncthreads();
+    int index = (threadIdx.x + 1) * stride * 2 - 1;
+    if (index < 2 * BLOCK_SIZE)
+      shared[index] += shared[index - stride];
   }
-  
-  stride = BLOCK_SIZE/2;    // calculate second half
-  while(stride > 0)
-  {
-       int index = (threadIdx.x+1)*stride*2 - 1;
-       if((index+stride) < 2*BLOCK_SIZE)
-       {
-	        shared[index+stride] += shared[index];
-       }				
-       stride /= 2;	
-       __syncthreads();
+
+  // down-sweep (distribution tree)
+  for (int stride = BLOCK_SIZE / 2; stride > 0; stride /= 2) {
+    __syncthreads();
+    int index = (threadIdx.x + 1) * stride * 2 - 1;
+    if (index + stride < 2 * BLOCK_SIZE)
+      shared[index + stride] += shared[index];
   }
-  
   __syncthreads();
-  
-  if(start < len)
+
+  if (start < len)
     output[start] = shared[threadIdx.x];
-  if(start+blockDim.x < len)
-    output[start+blockDim.x] = shared[blockDim.x + threadIdx.x];
-  if(threadIdx.x == blockDim.x-1)
-    aux[blockIdx.x] = shared[2*blockDim.x-1];
+  if (start + blockDim.x < len)
+    output[start + blockDim.x] = shared[blockDim.x + threadIdx.x];
+  if (aux != NULL && threadIdx.x == blockDim.x - 1)
+    aux[blockIdx.x] = shared[2 * blockDim.x - 1];
 }
-
-
 
 int main(int argc, char **argv) {
   wbArg_t args;
@@ -168,18 +114,22 @@ int main(int argc, char **argv) {
   wbTime_stop(GPU, "Copying input memory to the GPU.");
 
   //@@ Initialize the grid and block dimensions here
-  dim3 dimGrid(ceil(numElements/float(BLOCK_SIZE * 2)), 1, 1);
+  int numBlocks = (numElements + 2 * BLOCK_SIZE - 1) / (2 * BLOCK_SIZE);
+  if (numBlocks > 2 * BLOCK_SIZE) {
+    wbLog(ERROR, "Input too large for a two-level scan: ", numElements);
+    return -1;
+  }
+  dim3 dimGrid(numBlocks, 1, 1);
   dim3 dimBlock(BLOCK_SIZE, 1, 1);
-  dim3 OneDGrid(1,1,1);
+  dim3 OneDGrid(1, 1, 1);
 
   wbTime_start(Compute, "Performing CUDA computation");
   //@@ Modify this to complete the functionality of the scan
   //@@ on the deivce
   scan<<<dimGrid, dimBlock>>>(deviceInput, deviceOutput, aux, numElements);
-  cudaDeviceSynchronize();
-  add<<<OneDGrid, dimBlock>>>(aux, SumAndScan, 2*BLOCK_SIZE);
-  cudaDeviceSynchronize();
-  scanLast<<<dimGrid,dimBlock>>>(SumAndScan, deviceOutput, numElements);
+  // scan only the numBlocks valid block totals (was 2*BLOCK_SIZE -> out-of-bounds)
+  scan<<<OneDGrid, dimBlock>>>(aux, SumAndScan, NULL, numBlocks);
+  addBlockSums<<<dimGrid, dimBlock>>>(SumAndScan, deviceOutput, numElements);
   cudaDeviceSynchronize();
   wbTime_stop(Compute, "Performing CUDA computation");
 

@@ -1,136 +1,141 @@
+// op5.cu -- Stacked optimizations on top of op4 (tree channel reduction):
+//   * Weight matrix (kernel values) in constant memory (0.5 point)
+//       every thread of a warp reads the same mask element at the same time
+//       -> one broadcast from the constant cache instead of global loads
+//   * Tuning with restrict and loop unrolling (3 points)
+//       __restrict__ promises input/output do not alias so the compiler can
+//       keep loads in registers / use the read-only path; K is a template
+//       parameter for the LeNet layers (K = 7) and the test cases (K = 3) so
+//       `#pragma unroll` fully unrolls the K x K loops (no loop counters,
+//       constant offsets, more ILP). Other K values use the generic kernel.
+//
+// Bugs fixed vs. the previous version: BLOCK_SIZE 128 -> 128*128 = 16384
+// threads per block (limit is 1024, the launch always failed), plus all the
+// tree-reduction bugs listed in op4.cu, and cudaFree() of a mask pointer that
+// was never allocated.
 #include <cmath>
 #include <iostream>
 #include "gpu-new-forward.h"
-#define BLOCK_SIZE 128
 
-__constant__  float const_mem[8192];
+#define MAX_MASK_ELEMS 8192   // 32 KB of the 64 KB constant memory
+__constant__ float const_mask[MAX_MASK_ELEMS];
 
-__global__ void conv_forward_kernel(float *output, const float *input, const float *mask, const int B, const int M, const int C, const int H, const int W, const int K,const int S)
+// KT > 0: compile-time kernel size (fully unrolled); KT == 0: runtime K
+template <int KT>
+__global__ void conv_forward_kernel(float * __restrict__ output, const float * __restrict__ input, const int B, const int M, const int C, const int H, const int W, const int K_rt, const int S)
 {
+    const int K = KT > 0 ? KT : K_rt;
+    const int H_out = (H - K) / S + 1;
+    const int W_out = (W - K) / S + 1;
+    const int T = blockDim.x;
+    const int CZ = blockDim.z;
 
-
-    const int H_out = (H - K)/S + 1;
-    const int W_out = (W - K)/S + 1;
-
-    extern __shared__ float shared_mem[];
+    extern __shared__ float partial[];   // [CZ][T][T]
 
     #define out_4d(i3, i2, i1, i0) output[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
-    #define in_4d(i3, i2, i1, i0) input[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
-    #define mask_4d(i3, i2, i1, i0) const_mem[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
-    #define tree(i2, i1, i0) shared_mem[i2 * BLOCK_SIZE * C + i1 * C + i0]
-    // Insert your GPU convolution kernel code here
-    
-    int W_gride;
-    if (W_out % BLOCK_SIZE != 0) {
-        W_gride = W_out / BLOCK_SIZE + 1;
-    } else {
-        W_gride = W_out / BLOCK_SIZE;
-    }
-    int m = blockIdx.x;
-    int h = (blockIdx.y / W_gride) * BLOCK_SIZE + threadIdx.y;
-    int w = (blockIdx.y % W_gride) * BLOCK_SIZE + threadIdx.x;
-    int b = blockIdx.z;
+    #define tree(z, y, x) partial[((z) * T + (y)) * T + (x)]
+
+    const int W_grid = (W_out + T - 1) / T;
+    const int m = blockIdx.x;
+    const int b = blockIdx.z;
+    const int h = (blockIdx.y / W_grid) * T + threadIdx.y;
+    const int w = (blockIdx.y % W_grid) * T + threadIdx.x;
+    const bool valid = (h < H_out && w < W_out);
 
     float sum = 0.0f;
-        if(h < H_out && w < W_out) {
-            for (int c = 0; c < C; c++) { // sum over all input channels
-                for (int q = 0; q < K; q++) {// KxK filter
-                    for (int p = 0; p < K; p++) {
-                        int input_row = h * S + p;
-                        int input_col = w * S + q;
-                        sum += in_4d(b, c, input_row, input_col) * mask_4d(m, c, p, q);
-                    }
-                }
-                tree(threadIdx.x, threadIdx.y, threadIdx.z) = sum;
-            // tree reduction
-            for (int tree = 1; tree < C; tree *= 2)
-            {
-                __syncthreads();
-                if ((threadIdx.z % (2 * tree) == 0) && (threadIdx.z + tree < C))
-                    tree(threadIdx.y, threadIdx.x, threadIdx.z) += tree(threadIdx.y, threadIdx.x, threadIdx.z + tree);
-            }
-            __syncthreads();
-            if (threadIdx.z == 0)
-                out_4d(blockIdx.x, blockIdx.y, h, w) = tree(threadIdx.y, threadIdx.x, 0);
+    if (valid) {
+        for (int c = threadIdx.z; c < C; c += CZ) {
+            const float *in_c = input + ((size_t)b * C + c) * H * W + (h * S) * W + (w * S);
+            const float *mask_c = const_mask + (m * C + c) * K * K;
+            #pragma unroll
+            for (int p = 0; p < K; p++) {   // K is a compile-time constant when KT > 0
+                #pragma unroll
+                for (int q = 0; q < K; q++)
+                    sum += in_c[p * W + q] * mask_c[p * K + q];
             }
         }
-    
-    
+    }
+    tree(threadIdx.z, threadIdx.y, threadIdx.x) = sum;
+
+    for (int stride = CZ / 2; stride > 0; stride /= 2) {
+        __syncthreads();
+        if (threadIdx.z < stride)
+            tree(threadIdx.z, threadIdx.y, threadIdx.x) += tree(threadIdx.z + stride, threadIdx.y, threadIdx.x);
+    }
+
+    if (threadIdx.z == 0 && valid)
+        out_4d(b, m, h, w) = tree(0, threadIdx.y, threadIdx.x);
+
     #undef out_4d
-    #undef in_4d
-    #undef mask_4d
     #undef tree
 }
 
-	
+
+static void check_cuda(const char *where)
+{
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        std::cout << "CUDA error (" << where << "): " << cudaGetErrorString(error) << std::endl;
+        exit(-1);
+    }
+}
+
 __host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_output, const float *host_input, const float *host_mask, float **device_output_ptr, float **device_input_ptr, float **device_mask_ptr, const int B, const int M, const int C, const int H, const int W, const int K, const int S)
 {
-    // Allocate memory and copy over the relevant data structures to the GPU
+    const int H_out = (H - K) / S + 1;
+    const int W_out = (W - K) / S + 1;
+    cudaMalloc((void **)device_output_ptr, (size_t)B * M * H_out * W_out * sizeof(float));
+    cudaMalloc((void **)device_input_ptr, (size_t)B * C * H * W * sizeof(float));
+    // the mask lives in __constant__ memory; there is no device buffer for it,
+    // but Mini-DNN later passes *device_mask_ptr to epilog -> cudaFree(nullptr) is a no-op
+    *device_mask_ptr = nullptr;
+    check_cuda("prolog malloc");
+    if ((size_t)M * C * K * K > MAX_MASK_ELEMS) {
+        std::cout << "mask (" << M * C * K * K << " floats) does not fit in constant memory" << std::endl;
+        exit(-1);
+    }
 
-    // We pass double pointers for you to initialize the relevant device pointers,
-    //  which are passed to the other two functions.
-
-    // Useful snippet for error checking
-    // cudaError_t error = cudaGetLastError();
-    // if(error != cudaSuccess)
-    // {
-    //     std::cout<<"CUDA error: "<<cudaGetErrorString(error)<<std::endl;
-    //     exit(-1);
-    // }
-    
-    cudaMalloc((void **)device_output_ptr, B * M * ((H - K)/S + 1) *  ((W - K)/S + 1) * sizeof(float));
-    cudaMalloc((void **)device_input_ptr, B * C *H * W * sizeof(float));
-    // cudaError_t error = cudaGetLastError();
-
-    // if(error != cudaSuccess)
-    // {
-    //     std::cout<<"CUDA error: "<<cudaGetErrorString(error)<<std::endl;
-    //     exit(-1);
-    // }
-
-    cudaMemcpy(*device_input_ptr, host_input, B * C * H * W * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpyToSymbol(const_mem, host_mask, M * C * K * K * sizeof(float));
-
-    // error = cudaGetLastError();
-    // if(error != cudaSuccess)
-    // {
-    //     std::cout<<"CUDA error: "<<cudaGetErrorString(error)<<std::endl;
-    //     exit(-1);
-    // }
+    cudaMemcpy(*device_input_ptr, host_input, (size_t)B * C * H * W * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(const_mask, host_mask, (size_t)M * C * K * K * sizeof(float));
+    check_cuda("prolog memcpy");
 }
 
 
 __host__ void GPUInterface::conv_forward_gpu(float *device_output, const float *device_input, const float *device_mask, const int B, const int M, const int C, const int H, const int W, const int K, const int S)
 {
-    // Set the kernel dimensions and call the kernel
-    int W_gride = ceil((float)((W - K) / S + 1) / BLOCK_SIZE);
-    int H_gride = ceil((float)((H - K) / S + 1) / BLOCK_SIZE);
-    int Y_gride = W_gride * H_gride;
+    const int H_out = (H - K) / S + 1;
+    const int W_out = (W - K) / S + 1;
 
-    dim3 blockDim(BLOCK_SIZE, BLOCK_SIZE, 1);
-    dim3 gridDim(M, Y_gride, B);
-    
-    conv_forward_kernel<<<gridDim, blockDim>>>(device_output, device_input, device_mask, B, M, C, H, W, K, S);
+    int CZ = 1;
+    while (CZ < C && CZ < 64) CZ *= 2;
+    int T = 16;
+    while (T > 1 && T * T * CZ > 1024) T /= 2;
 
-    // cudaError_t error = cudaGetLastError();
-    // if(error != cudaSuccess)
-    // {
-    //     std::cout<<"CUDA error: "<<cudaGetErrorString(error)<<std::endl;
-    //     exit(-1);
-    // }
+    const int W_grid = (W_out + T - 1) / T;
+    const int H_grid = (H_out + T - 1) / T;
+    dim3 blockDim(T, T, CZ);
+    dim3 gridDim(M, H_grid * W_grid, B);
+    const size_t smem = (size_t)T * T * CZ * sizeof(float);
+
+    if (K == 7)
+        conv_forward_kernel<7><<<gridDim, blockDim, smem>>>(device_output, device_input, B, M, C, H, W, K, S);
+    else if (K == 3)
+        conv_forward_kernel<3><<<gridDim, blockDim, smem>>>(device_output, device_input, B, M, C, H, W, K, S);
+    else
+        conv_forward_kernel<0><<<gridDim, blockDim, smem>>>(device_output, device_input, B, M, C, H, W, K, S);
+    check_cuda("op5 conv launch");
 }
 
 
 __host__ void GPUInterface::conv_forward_gpu_epilog(float *host_output, float *device_output, float *device_input, float *device_mask, const int B, const int M, const int C, const int H, const int W, const int K, const int S)
 {
-    // Copy the output back to host
-    cudaMemcpy(host_output, device_output, B * M * ((H - K)/S + 1) * ((W - K)/S + 1)* sizeof(float), cudaMemcpyDeviceToHost);
+    const int H_out = (H - K) / S + 1;
+    const int W_out = (W - K) / S + 1;
+    cudaMemcpy(host_output, device_output, (size_t)B * M * H_out * W_out * sizeof(float), cudaMemcpyDeviceToHost);
 
-    // Free device memory
     cudaFree(device_output);
     cudaFree(device_input);
     cudaFree(device_mask);
-
 }
 
 

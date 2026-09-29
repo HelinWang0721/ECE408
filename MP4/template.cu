@@ -11,65 +11,52 @@
   } while (0)
 
 ////@@ Define any useful program-wide constants here
+// Strategy: output tile TILE_SIZE^3 per block (one thread per output voxel),
+// input tile (TILE_SIZE + MASK_SIZE - 1)^3 in shared memory, mask in constant memory.
+// (Previously TILE_SIZE == MASK_SIZE == 3: 27-thread blocks whose loaded data
+//  was ~78% halo, and the load index hard-coded MASK_SIZE as the block width.)
 #define     MASK_SIZE      3
 #define     MASK_RADIUS    (MASK_SIZE / 2)
-#define     TILE_SIZE      MASK_SIZE 
+#define     TILE_SIZE      8
 #define     W	(TILE_SIZE + MASK_SIZE - 1)
 
 ////@@ Define constant memory for device kernel here
-__constant__ float c_deviceKernel[MASK_SIZE * MASK_SIZE * MASK_SIZE]; 
+__constant__ float c_deviceKernel[MASK_SIZE * MASK_SIZE * MASK_SIZE];
 
 __global__ void conv3d(float *input, float *output, const int z_size,
                        const int y_size, const int x_size) {
     ////@@ Insert kernel code her
+    // [z][y][x]: consecutive threadIdx.x -> consecutive shared addresses (no bank conflicts)
     __shared__ float Nds[W][W][W];
-    int tid = threadIdx.x + (threadIdx.y * MASK_SIZE) + (threadIdx.z * MASK_SIZE * MASK_SIZE);
+    int tid = threadIdx.x + threadIdx.y * TILE_SIZE + threadIdx.z * TILE_SIZE * TILE_SIZE;
 
-    if (tid < W * W)
-    {
-	int tileX = tid % W;
-	int tileY = (tid / W) % W;
-	int srcX = blockIdx.x * TILE_SIZE + tileX - MASK_RADIUS;
-	int srcY = blockIdx.y * TILE_SIZE + tileY - MASK_RADIUS;
-	int srcZ = blockIdx.z * TILE_SIZE - MASK_RADIUS;
-	for (int i = 0; i < W; i++)
-	{
-	    int zpos = srcZ + i;
-
-	    if(zpos >= 0 && zpos < z_size && srcY >= 0 && srcY < y_size && srcX >= 0 && srcX < x_size)
-	    {
-		int src = zpos * x_size * y_size + srcY * x_size + srcX;
-		Nds[tileX][tileY][i] = input[src];
-	    }
-	    else
-	    {
-		Nds[tileX][tileY][i] = 0;
-	    }
-	}
+    // cooperative load of the W^3 input tile (incl. halo, zero-padded ghost cells)
+    for (int i = tid; i < W * W * W; i += TILE_SIZE * TILE_SIZE * TILE_SIZE) {
+        int tileX = i % W;
+        int tileY = (i / W) % W;
+        int tileZ = i / (W * W);
+        int srcX = blockIdx.x * TILE_SIZE + tileX - MASK_RADIUS;
+        int srcY = blockIdx.y * TILE_SIZE + tileY - MASK_RADIUS;
+        int srcZ = blockIdx.z * TILE_SIZE + tileZ - MASK_RADIUS;
+        if (srcZ >= 0 && srcZ < z_size && srcY >= 0 && srcY < y_size && srcX >= 0 && srcX < x_size)
+            Nds[tileZ][tileY][tileX] = input[(srcZ * y_size + srcY) * x_size + srcX];
+        else
+            Nds[tileZ][tileY][tileX] = 0.0f;
     }
-
     __syncthreads();
 
-    float result = 0;
-    int z = threadIdx.z + (blockIdx.z * TILE_SIZE);
-    int y = threadIdx.y + (blockIdx.y * TILE_SIZE);
-    int x = threadIdx.x + (blockIdx.x * TILE_SIZE);
-    if(z < z_size && y < y_size && x < x_size)
-    {
-	for (int i = 0; i < MASK_SIZE; ++i)
-	{
-	    for (int j = 0; j < MASK_SIZE; ++j)
-            {
-		for (int k = 0; k < MASK_SIZE; ++k)
-		{
-		    result += Nds[threadIdx.x + i][threadIdx.y + j][threadIdx.z + k] * c_deviceKernel[k * MASK_SIZE * MASK_SIZE + j * MASK_SIZE + i];
-		}
-	    }
-	}
-	output[x + (y * x_size) + (z * x_size * y_size)] = result;
+    int z = threadIdx.z + blockIdx.z * TILE_SIZE;
+    int y = threadIdx.y + blockIdx.y * TILE_SIZE;
+    int x = threadIdx.x + blockIdx.x * TILE_SIZE;
+    if (z < z_size && y < y_size && x < x_size) {
+        float result = 0.0f;
+        for (int k = 0; k < MASK_SIZE; ++k)          // z
+            for (int j = 0; j < MASK_SIZE; ++j)      // y
+                for (int i = 0; i < MASK_SIZE; ++i)  // x
+                    result += Nds[threadIdx.z + k][threadIdx.y + j][threadIdx.x + i] *
+                              c_deviceKernel[(k * MASK_SIZE + j) * MASK_SIZE + i];
+        output[(z * y_size + y) * x_size + x] = result;
     }
-
-    __syncthreads();
 }
 
 int main(int argc, char *argv[]) {

@@ -74,7 +74,6 @@ int main(int argc, char **argv) {
   //@@ Copy memory to the GPU here
   cudaMemcpy(deviceA, hostA, numARows * numAColumns * sizeof(float),cudaMemcpyHostToDevice);
   cudaMemcpy(deviceB, hostB, numBRows * numBColumns * sizeof(float),cudaMemcpyHostToDevice);
-  cudaMemcpy(deviceC, hostC, numCRows * numCColumns * sizeof(float),cudaMemcpyHostToDevice);
 
   wbTime_stop(GPU, "Copying input memory to the GPU.");
 
@@ -93,8 +92,8 @@ int main(int argc, char **argv) {
 
   wbTime_start(Copy, "Copying output memory to the CPU");
   //@@ Copy the GPU memory back to the CPU here
-  cudaMemcpy(hostA, deviceA, numCRows * numCColumns * sizeof(float),cudaMemcpyDeviceToHost);
-  cudaMemcpy(hostB, deviceA, numCRows * numCColumns * sizeof(float),cudaMemcpyDeviceToHost);
+  // Only C is an output. (Copying numCRows*numCColumns floats back into
+  // hostA/hostB overflowed those buffers whenever A or B is smaller than C.)
   cudaMemcpy(hostC, deviceC, numCRows * numCColumns * sizeof(float),cudaMemcpyDeviceToHost);
 
   wbTime_stop(Copy, "Copying output memory to the CPU");

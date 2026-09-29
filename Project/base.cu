@@ -56,7 +56,8 @@ __global__ void conv_forward_kernel(float *output, const float *input, const flo
                         int input_row = h * S + p;
                         int input_col = w * S + q;
                         sum += in_4d(b, c, input_row, input_col) * mask_4d(m, c, p, q);
-                        __syncthreads();
+                        // (removed __syncthreads(): no shared memory is used, and a
+                        //  barrier inside `if (h < H_out && w < W_out)` is divergent)
                     }
                 }
             }

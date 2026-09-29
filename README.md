@@ -47,3 +47,13 @@ rai -p ./MP0
 ****
 On Windows, you'll need to install WSL and a virtual linux OS. Several Linux versions are available
 through the Microsoft Store.
+
+# Study notes & local testing (added)
+
+* **Knowledge map / bug log:** [docs/CUDA_KNOWLEDGE.md](docs/CUDA_KNOWLEDGE.md)
+* **Run everything on a local GPU**
+  * Windows: `powershell -ExecutionPolicy Bypass -File tools\run_all_windows.ps1` (outputs to `D:\Claude\ece408-build`)
+  * Linux: `tools/run_mps.sh gpu` and `tools/run_project.sh gpu`
+* **Without a GPU:** `tools/run_mps.sh sim` and `tools/run_project.sh sim` use a CPU emulator (`tools/cudasim`)
+* `tools/include/wb.h` is a minimal libwb replacement so the MPs build outside RAI;
+  `Project/test/test_ops.cu` tests any Project implementation (`-DOP_ID=0..6`) against the CPU reference.
