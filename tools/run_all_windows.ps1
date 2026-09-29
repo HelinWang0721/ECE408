@@ -50,7 +50,26 @@ if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
 }
 & nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader | ForEach-Object { Log "GPU: $_" }
 
-$NvccFlags = @("-std=c++17", "-O3", "-arch=$Arch", "-Xcompiler", "/EHsc", "-Wno-deprecated-gpu-targets")
+# /utf-8: CUDA headers contain non-ASCII characters; without it MSVC warns (C4819)
+# on non-UTF-8 code pages such as Chinese Windows (936).
+$NvccFlags = @("-std=c++17", "-O3", "-arch=$Arch", "-Xcompiler", "/EHsc,/utf-8", "-Wno-deprecated-gpu-targets")
+$NvccExe = (Get-Command nvcc).Source
+
+# Run a native program with stdout+stderr going to $LogFile; returns the exit code.
+# (Windows PowerShell 5.1 turns any stderr output of `& exe` into a terminating
+#  NativeCommandError under ErrorActionPreference=Stop, e.g. compiler warnings.)
+function Invoke-Logged([string]$Exe, [string[]]$ArgList, [string]$LogFile, [string]$WorkDir = $Root, [switch]$Append) {
+    $quoted = $ArgList | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }
+    $out = "$LogFile.stdout.tmp"; $err = "$LogFile.stderr.tmp"
+    $sp = @{ FilePath = $Exe; WorkingDirectory = $WorkDir; NoNewWindow = $true; Wait = $true; PassThru = $true
+             RedirectStandardOutput = $out; RedirectStandardError = $err }
+    if ($quoted) { $sp.ArgumentList = ($quoted -join ' ') }   # empty -ArgumentList is an error in PS 5.1
+    $p = Start-Process @sp
+    $text = @(Get-Content $out) + @(Get-Content $err)
+    if ($Append) { Add-Content -Path $LogFile -Value $text } else { Set-Content -Path $LogFile -Value $text }
+    Remove-Item $out, $err -ErrorAction SilentlyContinue
+    return $p.ExitCode
+}
 
 # ---------------------------------------------------------------- MPs
 if (-not $SkipMPs) {
@@ -58,10 +77,10 @@ if (-not $SkipMPs) {
     foreach ($mp in "MP0","MP1","MP2","MP3","MP4","MP5","MP6","MP7","MP8") {
         $exe = Join-Path $OutDir "$mp.exe"
         $buildLog = Join-Path $OutDir "$mp.build.log"
-        & nvcc @NvccFlags -I "$Root\tools\include" "$Root\$mp\template.cu" -o $exe *> $buildLog
-        if ($LASTEXITCODE -ne 0) { Log ("{0,-5} BUILD FAILED (see {1})" -f $mp, $buildLog); continue }
+        $rc = Invoke-Logged $NvccExe ($NvccFlags + @("-I", "$Root\tools\include", "$Root\$mp\template.cu", "-o", $exe)) $buildLog
+        if ($rc -ne 0) { Log ("{0,-5} BUILD FAILED (see {1})" -f $mp, $buildLog); continue }
         if ($mp -eq "MP0") {
-            & $exe *> (Join-Path $OutDir "MP0.log"); Log ("{0,-5} ran (device query, see MP0.log)" -f $mp); continue
+            $null = Invoke-Logged $exe @() (Join-Path $OutDir "MP0.log"); Log ("{0,-5} ran (device query, see MP0.log)" -f $mp); continue
         }
         # replay the dataset command lines from the MP's run_datasets script
         $script = Get-Content "$Root\$mp\run_datasets" -Raw
@@ -71,9 +90,7 @@ if (-not $SkipMPs) {
         foreach ($i in $ids) {
             $argLine = $line.Replace('${i}', $i) -replace '^\./template\s*', ''
             $runLog = Join-Path $OutDir "$mp.data$i.log"
-            Push-Location "$Root\$mp"
-            & $exe ($argLine -split "\s+") *> $runLog
-            Pop-Location
+            $null = Invoke-Logged $exe ($argLine -split "\s+") $runLog "$Root\$mp"
             if (Select-String -Quiet -Path $runLog -Pattern "WB_RESULT PASS") { $pass++ } else { $fail++; Log "  $mp dataset $i FAILED -> $runLog" }
         }
         Log ("{0,-5} pass={1} fail={2}" -f $mp, $pass, $fail)
@@ -89,11 +106,11 @@ if (-not $SkipProject) {
         $tol = if ($op -eq "op3") { "2e-2" } else { "1e-3" }
         $exe = Join-Path $OutDir "test_$op.exe"
         $buildLog = Join-Path $OutDir "test_$op.build.log"
-        & nvcc @NvccFlags -I "$Root\Project\custom" "-DOP_ID=$id" "-DTOL=$tol" "$Root\Project\test\test_ops.cu" -o $exe *> $buildLog
-        if ($LASTEXITCODE -ne 0) { Log ("{0,-12} BUILD FAILED (see {1})" -f $op, $buildLog); continue }
+        $rc = Invoke-Logged $NvccExe ($NvccFlags + @("-I", "$Root\Project\custom", "-DOP_ID=$id", "-DTOL=$tol", "$Root\Project\test\test_ops.cu", "-o", $exe)) $buildLog
+        if ($rc -ne 0) { Log ("{0,-12} BUILD FAILED (see {1})" -f $op, $buildLog); continue }
         $runLog = Join-Path $OutDir "test_$op.log"
-        & $exe *> $runLog
-        & $exe bench $Batch 3 *>> $runLog
+        $null = Invoke-Logged $exe @() $runLog
+        $null = Invoke-Logged $exe @("bench", "$Batch", "3") $runLog -Append
         $ok = -not (Select-String -Quiet -Path $runLog -Pattern "RESULT FAIL|CUDA error")
         # last repetition = warmed-up timing
         $times = Select-String -Path $runLog -Pattern "^(layer\d)\s+B=$Batch .*Op Time\s+([0-9.]+) ms" | Select-Object -Last 2
